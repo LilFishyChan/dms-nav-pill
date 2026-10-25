@@ -36,6 +36,8 @@ DEFAULTS = {
 }
 MAX_FINGERS = 1                 # 只认单指
 
+_NIRI_ENV = None                # NIRI_SOCKET 查一次就够，别每秒 fork systemctl
+
 
 def load_config() -> dict:
     cfg = dict(DEFAULTS)
@@ -49,28 +51,61 @@ def load_config() -> dict:
     return cfg
 
 
-def read_scale() -> float:
-    """读 niri 的输出缩放，把逻辑像素换算成 evdev 的物理像素。"""
+def read_output() -> tuple[float, str]:
+    """读 niri 的输出缩放和旋转。
+
+    返回 (scale, transform)。evdev 给的是设备原生坐标，不随屏幕旋转变化，
+    所以判定"哪条边是屏幕底部"必须靠 transform 换算。
+    """
+    global _NIRI_ENV
     try:
-        env = dict(os.environ)
-        sock = env.get("NIRI_SOCKET")
-        if not sock:
-            out = subprocess.run(["systemctl", "--user", "show-environment"],
-                                 capture_output=True, text=True, timeout=3).stdout
-            for line in out.splitlines():
-                if line.startswith("NIRI_SOCKET="):
-                    env["NIRI_SOCKET"] = line.split("=", 1)[1]
-                    break
+        if _NIRI_ENV is None:
+            env = dict(os.environ)
+            if not env.get("NIRI_SOCKET"):
+                out = subprocess.run(["systemctl", "--user", "show-environment"],
+                                     capture_output=True, text=True, timeout=3).stdout
+                for line in out.splitlines():
+                    if line.startswith("NIRI_SOCKET="):
+                        env["NIRI_SOCKET"] = line.split("=", 1)[1]
+                        break
+            _NIRI_ENV = env
+        env = _NIRI_ENV
         res = subprocess.run(["niri", "msg", "--json", "outputs"],
                              capture_output=True, text=True, timeout=3, env=env)
         data = json.loads(res.stdout)
         for node in data.values():
-            scale = (node.get("logical") or {}).get("scale")
+            logical = node.get("logical") or {}
+            scale = logical.get("scale")
             if scale:
-                return float(scale)
+                tf = logical.get("transform")
+                if isinstance(tf, dict):
+                    tf = tf.get("name") or tf.get("type") or "normal"
+                return float(scale), str(tf or "normal").lower().replace("_", "-")
     except Exception:  # noqa: BLE001
         pass
-    return 1.0
+    return 1.0, "normal"
+
+
+def edge_geometry(transform: str, w: int, h: int):
+    """屏幕底边在物理坐标里的位置，以及屏幕上滑对应的物理方向。
+
+    evdev 的 (x, y) 是设备原生坐标（竖屏 1600×2560），屏幕转了之后
+    用户看到的"底部"和"上滑"都跟着换边，这里换算一次给判定用。
+
+    返回 (轴, 底边坐标, 上滑方向符号)。
+    """
+    t = transform or "normal"
+    if t == "90":
+        # 屏幕底部 = 物理右边；屏幕上滑 = x 减小
+        return "x", w, -1
+    if t == "180":
+        # 屏幕底部 = 物理顶部；屏幕上滑 = y 增大
+        return "y", 0, +1
+    if t == "270":
+        # 屏幕底部 = 物理左边；屏幕上滑 = x 增大
+        return "x", 0, +1
+    # normal：屏幕底部 = 物理底边；屏幕上滑 = y 减小
+    return "y", h, -1
 
 
 def settings_mtime() -> float:
@@ -106,7 +141,7 @@ def main() -> int:
         return 1
 
     cfg = load_config()
-    scale = read_scale()
+    scale, transform = read_output()
     mtime = settings_mtime()
     last_check = time.monotonic()
 
@@ -127,6 +162,8 @@ def main() -> int:
             if new != mtime:
                 mtime = new
                 cfg = load_config()
+            # 朝向可能变了，顺手重读一次（很轻，3 秒超时的一次 niri 调用）
+            scale, transform = read_output()
 
         if event.type == ecodes.EV_ABS:
             code, val = event.code, event.value
@@ -148,19 +185,28 @@ def main() -> int:
                 max_fingers, start, last = 0, None, None
             else:
                 if touching and start and last and max_fingers <= MAX_FINGERS:
-                    dy = (last[1] - start[1]) / h      # 向上为负
-                    dx = (last[0] - start[0]) / w
-
                     band_px = cfg["bottom_band_px"] * scale
                     min_swipe = cfg["swipe_min_pct"] / 100.0
                     bias = cfg["vertical_bias_x10"] / 10.0
                     cooldown = cfg["cooldown_ms"] / 1000.0
 
-                    # 起点距离屏幕底边不超过 band_px
-                    started_low = (h - start[1]) <= band_px
-                    vertical = abs(dy) > abs(dx) * bias
+                    axis, edge_pos, sign = edge_geometry(transform, w, h)
+                    if axis == "y":
+                        along = (last[1] - start[1]) * sign    # >0 = 朝屏幕上方
+                        across = (last[0] - start[0])
+                        span, span_across = h, w
+                        started_low = abs(start[1] - edge_pos) <= band_px
+                    else:
+                        along = (last[0] - start[0]) * sign
+                        across = (last[1] - start[1])
+                        span, span_across = w, h
+                        started_low = abs(start[0] - edge_pos) <= band_px
+
+                    moved = along / span
+                    sideways = abs(across) / span_across
+                    vertical = moved > sideways * bias
                     t = time.monotonic()
-                    if (started_low and vertical and dy < -min_swipe
+                    if (started_low and vertical and moved > min_swipe
                             and t - last_fire > cooldown):
                         last_fire = t
                         print("BOTTOM_SWIPE", flush=True)
