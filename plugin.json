@@ -2,7 +2,7 @@
     "id": "nabuNavPill",
     "name": "Navigation Pill",
     "description": "Android-style gesture bar at the bottom edge",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "author": "LilFishyChan",
     "icon": "swipe",
     "type": "composite",

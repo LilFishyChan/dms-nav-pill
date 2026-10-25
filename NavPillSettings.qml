@@ -12,6 +12,41 @@ PluginSettings {
         return I18n.trFor("nabuNavPill", term);
     }
 
+    // ---- 启动阶段的写入守卫 ----
+    // DMS 会在插件数据从磁盘加载之前就预创建设置页；此时每个 Setting 的
+    // loadValue() 只能拿到 defaultValue，而 onValueChanged 会立刻把这个默认值
+    // 保存回去，把磁盘上的真实设置冲掉（症状：重启 DMS 后设置全变回默认）。
+    // 所以在数据就绪之前一律拦住写入，就绪后再统一重读一遍。
+    property bool savingEnabled: false
+
+    function saveValue(key, value) {
+        if (!settings.savingEnabled)
+            return
+        if (pluginService && pluginService.savePluginData) {
+            pluginService.savePluginData(pluginId, key, value)
+            settingChanged()
+        }
+    }
+
+    Timer {
+        interval: 1200
+        running: true
+        repeat: false
+        onTriggered: {
+            // 此刻数据已就绪，先把所有控件重读成真实值
+            const stack = [settings]
+            while (stack.length > 0) {
+                const item = stack.pop()
+                if (typeof item.loadValue === "function")
+                    item.loadValue()
+                for (let i = 0; i < item.children.length; i++)
+                    stack.push(item.children[i])
+            }
+            // 之后才允许写入
+            settings.savingEnabled = true
+        }
+    }
+
     // 动作表：value 必须和 NavPill.qml 的 ACTIONS 键一致。
     // "hide" 是内部动作（收回横条），其余走命令表。
     readonly property var actionOptions: [
@@ -70,6 +105,13 @@ PluginSettings {
             minimum: rs.minimum
             maximum: rs.maximum
             unit: rs.unit
+
+            Timer {
+                interval: 1000
+                running: true
+                repeat: false
+                onTriggered: slider.loadValue()
+            }
 
             // SliderSetting 没暴露 step，注入给内部 DSlider
             Component.onCompleted: {
@@ -138,10 +180,21 @@ PluginSettings {
                 label: ""
                 options: settings.actionOptions
                 defaultValue: gestureRow.defaultAction
+
+                // DMS 会在插件数据加载之前就预创建设置页，那时 loadValue()
+                // 只能拿到 defaultValue，随后 onValueChanged 会把默认值写回去。
+                // 等数据就绪后重新读一次。
+                Timer {
+                    interval: 1000
+                    running: true
+                    repeat: false
+                    onTriggered: sel.loadValue()
+                }
             }
         }
 
         StringSetting {
+            id: customCmd
             visible: sel.value === "custom"
             height: visible ? implicitHeight : 0
             settingKey: "custom_" + gestureRow.settingKey
@@ -149,6 +202,13 @@ PluginSettings {
             description: ""
             placeholder: "niri msg action toggle-overview"
             defaultValue: ""
+
+            Timer {
+                interval: 1000
+                running: true
+                repeat: false
+                onTriggered: customCmd.loadValue()
+            }
         }
     }
 
