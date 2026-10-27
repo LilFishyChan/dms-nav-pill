@@ -62,7 +62,14 @@ ShellRoot {
         color: "transparent"
         WlrLayershell.layer: WlrLayer.Overlay
         WlrLayershell.namespace: "nabu-nav-pill"
-        WlrLayershell.exclusiveZone: 0
+        /*
+         * -1 = 完全忽略其他 surface 的 exclusive zone，锚在真实屏幕边缘。
+         *
+         * 0 只是"自己不预留空间"，但仍会被别人预留的区域挤开 —— 虚拟键盘
+         * 弹出时就把可用区域缩短，导航条跟着被顶到键盘上方去。改成 -1 后
+         * 它钉死在屏幕物理底边，键盘只会盖在上面（Overlay 层在键盘之上）。
+         */
+        WlrLayershell.exclusiveZone: -1
 
         // ==================== 工具函数 ====================
         function reveal() {
